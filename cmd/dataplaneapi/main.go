@@ -116,6 +116,35 @@ func startServer(cfg *configuration.Configuration, cancelDebugServer context.Can
 		return reload
 	}
 
+	// Snapshot the post-parse, pre-yaml baselines for hot-reload candidate
+	// validation; the same guards as SyncWithFileSettings overlay YAML onto
+	// these values when a change is evaluated.
+	cliBaseline := cfg.HAProxy
+	serverBaseline := configuration.ServerSettings{
+		EnabledListeners: server.EnabledListeners,
+		Host:             server.Host,
+		Port:             server.Port,
+		TLSHost:          server.TLSHost,
+		TLSPort:          server.TLSPort,
+		TLSCertificate:   string(server.TLSCertificate),
+		TLSKey:           string(server.TLSCertificateKey),
+		TLSCACertificate: string(server.TLSCACertificate),
+		SocketPath:       string(server.SocketPath),
+	}
+	hotReloadParams := configuration.HotReloadParams{
+		ConfigPath:     cliBaseline.DataplaneConfig,
+		CLIBaseline:    cliBaseline,
+		ServerBaseline: serverBaseline,
+		Reload:         cfg.Notify.Reload.Notify,
+	}
+
+	// Reconcile against the persisted last-accepted generation before
+	// loading any on-disk content. No-op when no ledger exists.
+	if _, err = configuration.ReconcileStartup(hotReloadParams); err != nil {
+		fmt.Println("configuration error:", err)
+		os.Exit(1)
+	}
+
 	var loadMsg []string
 	_, err = cfg.Load()
 	if err != nil {
@@ -211,6 +240,19 @@ func startServer(cfg *configuration.Configuration, cancelDebugServer context.Can
 			return
 		}
 	}()
+
+	// Start the dataplaneapi.yaml hot-reload watcher. It is started after
+	// cfg.Save(), so the process's own startup rewrite can never self-trigger;
+	// an accepted candidate drives the same graceful restart loop as SIGHUP.
+	// Failure is non-fatal and independent of the haproxy.cfg watcher.
+	if !cfg.HAProxy.DisableInotify {
+		coordinator, coordErr := configuration.NewHotReloadCoordinator(hotReloadParams)
+		if coordErr != nil {
+			log.Errorf("Hot-reload watcher disabled: %s", coordErr.Error())
+		} else {
+			go coordinator.Run(dataplaneapi.ContextHandler.Context())
+		}
+	}
 
 	server.ConfigureAPI()
 	dataplaneapi.SetServerStartedCallback(cfg.Notify.ServerStarted.Notify)

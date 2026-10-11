@@ -277,12 +277,12 @@ func copyToConfiguration(cfg *Configuration) { //nolint:cyclop,maintidx
 	if cfgStorage.LogTargets != nil {
 		cfg.LogTargets = *cfgStorage.LogTargets
 	}
-	if cfgStorage.Dataplaneapi != nil && cfgStorage.Haproxy.DelayedStartMax != nil && !misc.HasOSArg("", "delayed-start-max", "") {
+	if cfgStorage.Dataplaneapi != nil && cfgStorage.Haproxy != nil && cfgStorage.Haproxy.DelayedStartMax != nil && !misc.HasOSArg("", "delayed-start-max", "") {
 		if d, err := time.ParseDuration(*cfgStorage.Haproxy.DelayedStartMax); err == nil {
 			cfg.HAProxy.DelayedStartMax = d
 		}
 	}
-	if cfgStorage.Dataplaneapi != nil && cfgStorage.Haproxy.DelayedStartTick != nil && !misc.HasOSArg("", "delayed-start-tick", "") {
+	if cfgStorage.Dataplaneapi != nil && cfgStorage.Haproxy != nil && cfgStorage.Haproxy.DelayedStartTick != nil && !misc.HasOSArg("", "delayed-start-tick", "") {
 		if d, err := time.ParseDuration(*cfgStorage.Haproxy.DelayedStartTick); err == nil {
 			cfg.HAProxy.DelayedStartTick = d
 		}
