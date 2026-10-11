@@ -127,9 +127,15 @@ type Options struct {
 	// Service discovery
 	ConsulDiscovery       sc.ServiceDiscoveries
 	ConsulPersistCallback func([]*models.Consul) error
-	AWSDiscovery          sc.ServiceDiscoveries
-	AWSPersistCallback    func([]*models.AwsRegion) error
-	UseValidation         bool
+	// ConsulWritable reports whether the consul state store accepts
+	// writes (false when read-only isolated or unavailable).
+	ConsulWritable func() bool
+	AWSDiscovery    sc.ServiceDiscoveries
+	AWSPersistCallback func([]*models.AwsRegion) error
+	// AWSWritable reports whether the AWS region state store accepts
+	// writes (false when read-only isolated or unavailable).
+	AWSWritable  func() bool
+	UseValidation bool
 
 	// API info
 	Version    string
@@ -249,10 +255,10 @@ func NewRouter(opts Options) (http.Handler, error) {
 
 		// — service discovery —
 		func() error {
-			return consul.RegisterRouter(r, opts.ConsulDiscovery, opts.ConsulPersistCallback, opts.UseValidation)
+			return consul.RegisterRouter(r, opts.ConsulDiscovery, opts.ConsulPersistCallback, opts.ConsulWritable, opts.UseValidation)
 		},
 		func() error {
-			return aws.RegisterRouter(r, opts.AWSDiscovery, opts.AWSPersistCallback, opts.UseValidation)
+			return aws.RegisterRouter(r, opts.AWSDiscovery, opts.AWSPersistCallback, opts.AWSWritable, opts.UseValidation)
 		},
 	}
 

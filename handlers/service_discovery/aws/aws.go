@@ -24,10 +24,11 @@ import (
 	sc "github.com/haproxytech/dataplaneapi/discovery"
 	"github.com/haproxytech/dataplaneapi/handlers/middleware"
 	"github.com/haproxytech/dataplaneapi/handlers/respond"
+	"github.com/haproxytech/dataplaneapi/storage"
 )
 
 // RegisterRouter registers all AWS service discovery routes onto r.
-func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallback func([]*models.AwsRegion) error, useValidation bool) error {
+func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallback func([]*models.AwsRegion) error, writable func() bool, useValidation bool) error {
 	spec, err := GetSpec()
 	if err != nil {
 		return err
@@ -35,6 +36,7 @@ func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallba
 	HandlerWithOptions(&HandlerImpl{
 		Discovery:       discovery,
 		PersistCallback: persistCallback,
+		Writable:        writable,
 		UseValidation:   useValidation,
 	}, ChiServerOptions{
 		BaseRouter:       r,
@@ -48,7 +50,21 @@ func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallba
 type HandlerImpl struct {
 	Discovery       sc.ServiceDiscoveries
 	PersistCallback func([]*models.AwsRegion) error
-	UseValidation   bool
+	// Writable reports whether the AWS region state accepts writes. When
+	// it reports false the subsystem is isolated and mutating requests
+	// fail with 503 before touching the in-memory discovery store.
+	Writable      func() bool
+	UseValidation bool
+}
+
+// requireWritable performs the isolation preflight for mutating
+// endpoints. It returns false when the response has already been written.
+func (h *HandlerImpl) requireWritable(w http.ResponseWriter) bool {
+	if h.Writable != nil && !h.Writable() {
+		respond.Error(w, storage.ErrReadOnly)
+		return false
+	}
+	return true
 }
 
 func (h *HandlerImpl) GetAWSRegions(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +89,10 @@ func (h *HandlerImpl) CreateAWSRegion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireWritable(w) {
+		return
+	}
+
 	if err := h.Discovery.AddNode("aws", *data.ID, &data); err != nil {
 		respond.Error(w, err)
 		return
@@ -93,6 +113,9 @@ func (h *HandlerImpl) CreateAWSRegion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HandlerImpl) DeleteAWSRegion(w http.ResponseWriter, r *http.Request, id string) {
+	if !h.requireWritable(w) {
+		return
+	}
 	if err := h.Discovery.RemoveNode("aws", id); err != nil {
 		respond.Error(w, err)
 		return
@@ -136,6 +159,10 @@ func (h *HandlerImpl) ReplaceAWSRegion(w http.ResponseWriter, r *http.Request, i
 
 	if err := sc.ValidateAWSData(&data, h.UseValidation); err != nil {
 		respond.Error(w, err)
+		return
+	}
+
+	if !h.requireWritable(w) {
 		return
 	}
 

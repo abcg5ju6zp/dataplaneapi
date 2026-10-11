@@ -17,6 +17,7 @@ type SDAWStorage interface {
 
 	Load() error
 	Store() error
+	Status() StatusReport
 }
 
 type AWS interface {
@@ -39,19 +40,19 @@ type AWSRegionStorageImpl struct {
 }
 
 // NewSDAWSRegionStorage creates a new AWSRegionStorageImpl with initial configuration from a file path.
+// It never fails on a corrupt state file: inspect Status for the independent
+// recovery conclusion (recovered / read-only isolated / unavailable).
 func NewSDAWSRegionStorage(path string) (SDAWStorage, error) {
-	fs := &fileStorage[storagetype.AWSRegionData]{path}
-	if err := fs.initFile(); err != nil {
-		return nil, err
-	}
-	AWSData, err := fs.Get()
-	if err != nil {
-		return nil, err
-	}
+	fs := newFileStorage[storagetype.AWSRegionData](path)
+	AWSData, _ := fs.Get()
 	return &AWSRegionStorageImpl{
 		storage: fs,
 		AWSData: AWSData,
 	}, nil
+}
+
+func (cs *AWSRegionStorageImpl) Status() StatusReport {
+	return cs.storage.Status()
 }
 
 func (cs *AWSRegionStorageImpl) GetAWSRegions() storagetype.AWSRegions {
@@ -64,11 +65,8 @@ func (cs *AWSRegionStorageImpl) Load() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	AWS, err := cs.load()
-	if err != nil {
-		return err
-	}
-	cs.AWSData = AWS
+	aws, _ := cs.storage.Get()
+	cs.AWSData = aws
 
 	return nil
 }
@@ -77,98 +75,56 @@ func (cs *AWSRegionStorageImpl) Store() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if err := cs.store(); err != nil {
-		return err
-	}
-	return nil
+	return cs.commit(cs.AWSData.AWSRegions)
 }
 
 func (cs *AWSRegionStorageImpl) AddAWSRegionAndStore(region *models.AwsRegion) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.addAWSRegion(region)
-
-	// In case something went wrong whil storing, delete the AWS from the store
-	if err := cs.store(); err != nil {
-		cs.removeAWSRegion(region)
-		return err
-	}
-	return nil
+	candidate := append(slices.Clone(cs.AWSData.AWSRegions), region)
+	return cs.commit(candidate)
 }
 
 func (cs *AWSRegionStorageImpl) AddAWSRegionsAndStore(regions storagetype.AWSRegions) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.addAWSRegions(regions)
-
-	// In case something went wrong whil storing, delete the AWS from the store
-	if err := cs.store(); err != nil {
-		cs.removeAWSRegions(regions)
-		return err
-	}
-	return nil
+	candidate := append(slices.Clone(cs.AWSData.AWSRegions), regions...)
+	return cs.commit(candidate)
 }
 
 func (cs *AWSRegionStorageImpl) ReplaceAllAWSRegionsAndStore(regions storagetype.AWSRegions) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	oldAWS := cs.AWSData.AWSRegions
 
-	cs.AWSData.AWSRegions = regions
-	if err := cs.store(); err != nil {
-		cs.AWSData.AWSRegions = oldAWS
-		return err
-	}
-	return nil
+	return cs.commit(slices.Clone(regions))
 }
 
 func (cs *AWSRegionStorageImpl) RemoveAWSRegionAndStore(region *models.AwsRegion) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.removeAWSRegion(region)
-
-	// In case something went wrong while storing, add the AWS to the store
-	if err := cs.store(); err != nil {
-		cs.addAWSRegion(region)
-		return err
-	}
-	return nil
-}
-
-func (cs *AWSRegionStorageImpl) addAWSRegion(region *models.AwsRegion) {
-	cs.AWSData.AWSRegions = append(cs.AWSData.AWSRegions, region)
-}
-
-func (cs *AWSRegionStorageImpl) addAWSRegions(regions storagetype.AWSRegions) {
-	cs.AWSData.AWSRegions = append(cs.AWSData.AWSRegions, regions...)
-}
-
-func (cs *AWSRegionStorageImpl) removeAWSRegion(region *models.AwsRegion) {
-	for i, u := range cs.AWSData.AWSRegions {
-		if u.Name == region.Name {
-			cs.AWSData.AWSRegions = slices.Delete(cs.AWSData.AWSRegions, i, i+1)
-			break
+	candidate := make(storagetype.AWSRegions, 0, len(cs.AWSData.AWSRegions))
+	for _, r := range cs.AWSData.AWSRegions {
+		if r.Name != region.Name {
+			candidate = append(candidate, r)
 		}
 	}
+	return cs.commit(candidate)
 }
 
-func (cs *AWSRegionStorageImpl) removeAWSRegions(regions storagetype.AWSRegions) {
-	for _, AWS := range cs.AWSData.AWSRegions {
-		cs.removeAWSRegion(AWS)
+// commit stores the candidate generation and swaps the in-memory active
+// object only after the durable write is verified. On failure the active
+// object converges with the engine's authoritative view (e.g. the
+// restored last known good generation); a failed write never leaves a
+// pending mutation visible.
+func (cs *AWSRegionStorageImpl) commit(regions storagetype.AWSRegions) error {
+	candidate := storagetype.AWSRegionData{AWSRegions: regions}
+	if err := cs.storage.Store(candidate); err != nil {
+		cs.AWSData = cs.storage.Active()
+		return err
 	}
-}
-
-func (cs *AWSRegionStorageImpl) setAWSRegions(regions storagetype.AWSRegions) {
-	cs.AWSData.AWSRegions = regions
-}
-
-func (cs *AWSRegionStorageImpl) store() error {
-	return cs.storage.Store(cs.AWSData)
-}
-
-func (cs *AWSRegionStorageImpl) load() (storagetype.AWSRegionData, error) {
-	return cs.storage.Get()
+	cs.AWSData = candidate
+	return nil
 }

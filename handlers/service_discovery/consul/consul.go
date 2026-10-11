@@ -24,10 +24,11 @@ import (
 	sc "github.com/haproxytech/dataplaneapi/discovery"
 	"github.com/haproxytech/dataplaneapi/handlers/middleware"
 	"github.com/haproxytech/dataplaneapi/handlers/respond"
+	"github.com/haproxytech/dataplaneapi/storage"
 )
 
 // RegisterRouter registers all Consul service discovery routes onto r.
-func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallback func([]*models.Consul) error, useValidation bool) error {
+func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallback func([]*models.Consul) error, writable func() bool, useValidation bool) error {
 	spec, err := GetSpec()
 	if err != nil {
 		return err
@@ -35,6 +36,7 @@ func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallba
 	HandlerWithOptions(&HandlerImpl{
 		Discovery:       discovery,
 		PersistCallback: persistCallback,
+		Writable:        writable,
 		UseValidation:   useValidation,
 	}, ChiServerOptions{
 		BaseRouter:       r,
@@ -48,7 +50,21 @@ func RegisterRouter(r chi.Router, discovery sc.ServiceDiscoveries, persistCallba
 type HandlerImpl struct {
 	Discovery       sc.ServiceDiscoveries
 	PersistCallback func([]*models.Consul) error
-	UseValidation   bool
+	// Writable reports whether the consul state accepts writes. When it
+	// reports false the subsystem is isolated and mutating requests fail
+	// with 503 before touching the in-memory discovery store.
+	Writable      func() bool
+	UseValidation bool
+}
+
+// requireWritable performs the isolation preflight for mutating
+// endpoints. It returns false when the response has already been written.
+func (h *HandlerImpl) requireWritable(w http.ResponseWriter) bool {
+	if h.Writable != nil && !h.Writable() {
+		respond.Error(w, storage.ErrReadOnly)
+		return false
+	}
+	return true
 }
 
 func (h *HandlerImpl) GetConsuls(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +94,10 @@ func (h *HandlerImpl) CreateConsul(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.requireWritable(w) {
+		return
+	}
+
 	if err := h.Discovery.AddNode("consul", *data.ID, &data); err != nil {
 		respond.Error(w, err)
 		return
@@ -98,6 +118,9 @@ func (h *HandlerImpl) CreateConsul(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HandlerImpl) DeleteConsul(w http.ResponseWriter, r *http.Request, id string) {
+	if !h.requireWritable(w) {
+		return
+	}
 	if err := h.Discovery.RemoveNode("consul", id); err != nil {
 		respond.Error(w, err)
 		return
@@ -146,6 +169,10 @@ func (h *HandlerImpl) ReplaceConsul(w http.ResponseWriter, r *http.Request, id s
 
 	if data.HealthCheckPolicy != nil && *data.HealthCheckPolicy == models.ConsulHealthCheckPolicyMin && data.HealthCheckPolicyMin <= 0 {
 		respond.BadRequest(w, "health_check_policy_min is required for 'min' health_check_policy")
+		return
+	}
+
+	if !h.requireWritable(w) {
 		return
 	}
 

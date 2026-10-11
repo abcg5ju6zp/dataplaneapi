@@ -34,6 +34,7 @@ import (
 
 	"github.com/haproxytech/dataplaneapi/rate"
 	"github.com/haproxytech/dataplaneapi/reload_agent"
+	"github.com/haproxytech/dataplaneapi/storage"
 )
 
 const (
@@ -49,6 +50,8 @@ const (
 	ErrHTTPRateLimit = int64(429)
 	// ErrHTTPOk HTTP status code 200
 	ErrHTTPOk = int64(200)
+	// ErrHTTPServiceUnavailable HTTP status code 503
+	ErrHTTPServiceUnavailable = int64(503)
 )
 
 func OutdatedTransactionError(id string) *models.Error {
@@ -100,6 +103,10 @@ func HandleError(err error) *models.Error {
 		if errors.Is(t, client_errors.ErrNotFound) {
 			code = ErrHTTPNotFound
 		} else if errors.Is(t, client_errors.ErrAlreadyExists) {
+			code = ErrHTTPConflict
+		} else if errors.Is(t, storage.ErrReadOnly) || errors.Is(t, storage.ErrStorageUnavailable) {
+			code = ErrHTTPServiceUnavailable
+		} else if errors.Is(t, storage.ErrStaleGeneration) {
 			code = ErrHTTPConflict
 		}
 		return &models.Error{Code: &code, Message: &msg}
@@ -218,6 +225,11 @@ func GetHTTPStatusFromErr(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, client_errors.ErrGeneral):
 		return http.StatusBadRequest
+	case errors.Is(err, storage.ErrStaleGeneration):
+		return http.StatusConflict
+	case errors.Is(err, storage.ErrReadOnly),
+		errors.Is(err, storage.ErrStorageUnavailable):
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

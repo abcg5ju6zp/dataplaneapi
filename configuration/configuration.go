@@ -237,32 +237,40 @@ func (c *Configuration) Load() ([]string, error) {
 }
 
 func (c *Configuration) LoadDataplaneStorageConfig() ([]string, error) {
-	var err error
 	var deprecationInfoMsg []string
 
 	//--------------------
 	// Load from dataplane storage cluster.json: users
 	// It has to be after copyToConfiguration as it needs the dataplaneapi_storage_path
 	//--------------------
-	if err = c.loadClusterModeData(); err != nil {
+	// Each kind of internal state reaches its own recovery conclusion:
+	// one corrupt file must never prevent the others (or the process)
+	// from starting.
+	if err := c.loadClusterModeData(); err != nil {
 		return deprecationInfoMsg, err
 	}
-	if err = c.loadSDConsuls(); err != nil {
+	if err := c.loadSDConsuls(); err != nil {
 		return deprecationInfoMsg, err
 	}
-	if err = c.loadSDAWSRegions(); err != nil {
+	if err := c.loadSDAWSRegions(); err != nil {
 		return deprecationInfoMsg, err
+	}
+	for _, r := range c.StorageStatus() {
+		if msg := storageWarning(r); msg != "" {
+			deprecationInfoMsg = append(deprecationInfoMsg, msg)
+		}
 	}
 
 	//--------------------
 	// Deprecated fields migration
 	//--------------------
-	deprecationInfoMsg, err = c.migrateDeprecatedFields()
+	migrationMsgs, err := c.migrateDeprecatedFields()
+	deprecationInfoMsg = append(deprecationInfoMsg, migrationMsgs...)
 	if err != nil {
 		return deprecationInfoMsg, err
 	}
 
-	return deprecationInfoMsg, err
+	return deprecationInfoMsg, nil
 }
 
 func (c *Configuration) LoadRuntimeVars(swaggerJSON json.RawMessage, host string, port int) error {

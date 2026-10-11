@@ -47,6 +47,7 @@ import (
 	"github.com/haproxytech/dataplaneapi/misc"
 	"github.com/haproxytech/dataplaneapi/resilient"
 	socket_runtime "github.com/haproxytech/dataplaneapi/runtime"
+	dapi_storage "github.com/haproxytech/dataplaneapi/storage"
 
 	// import various crypting algorithms
 	_ "github.com/GehirnInc/crypt/md5_crypt"
@@ -148,7 +149,15 @@ func configureAPI(maxBodySize int64) (http.Handler, func()) { //nolint:maintidx
 	// this is not part of GetUsersStore(),
 	// in case of reload we need to reread users
 	if err := users.Init(); err != nil {
-		log.Fatalf("Error initiating users: %s", err.Error())
+		// When the users state is isolated (both the active file and the
+		// last known good copy are unusable), keep the API running with
+		// users read from the HAProxy userlist instead of exiting.
+		status := cfg.GetClusterModeStorage().Status()
+		if status.State == dapi_storage.Unavailable || status.State == dapi_storage.ReadOnlyIsolated {
+			log.Warningf("users state is %s (%s); starting with HAProxy userlist users only: %s", status.State, status.Detail, err.Error())
+		} else {
+			log.Fatalf("Error initiating users: %s", err.Error())
+		}
 	}
 
 	// Handle reload signals
@@ -182,33 +191,48 @@ func configureAPI(maxBodySize int64) (http.Handler, func()) { //nolint:maintidx
 		ReloadAgent: ra,
 		Context:     ctx,
 	})
-	for _, data := range cfg.ServiceDiscovery.Consuls {
-		var errSD error
-		if data.ID == nil || len(*data.ID) == 0 {
-			data.ID = service_discovery.NewServiceDiscoveryUUID()
-		}
-		if errSD = service_discovery.ValidateConsulData(data, true); errSD != nil {
-			log.Fatal("Error validating Consul instance: " + errSD.Error())
-		}
-		if errSD = discovery.AddNode("consul", *data.ID, data); errSD != nil {
-			log.Warning("Error creating consul instance: " + errSD.Error())
-		}
-	}
-	_ = cfg.SaveConsuls(cfg.ServiceDiscovery.Consuls)
 
-	for _, data := range cfg.ServiceDiscovery.AWSRegions {
-		var errSD error
-		if data.ID == nil || len(*data.ID) == 0 {
-			data.ID = service_discovery.NewServiceDiscoveryUUID()
+	// Subsystems whose state is unavailable have no data to serve: their
+	// discovery instances are skipped and their mutating API endpoints
+	// answer 503. Recovered/read-only subsystems still start from the
+	// last known good generation.
+	consulStatus := storageStatus(cfg, dapi_storage.SubsystemConsul)
+	if consulStatus.State == dapi_storage.Unavailable {
+		log.Warningf("consul service discovery is isolated and unavailable: %s", consulStatus.Detail)
+	} else {
+		for _, data := range cfg.ServiceDiscovery.Consuls {
+			var errSD error
+			if data.ID == nil || len(*data.ID) == 0 {
+				data.ID = service_discovery.NewServiceDiscoveryUUID()
+			}
+			if errSD = service_discovery.ValidateConsulData(data, true); errSD != nil {
+				log.Fatal("Error validating Consul instance: " + errSD.Error())
+			}
+			if errSD = discovery.AddNode("consul", *data.ID, data); errSD != nil {
+				log.Warning("Error creating consul instance: " + errSD.Error())
+			}
 		}
-		if errSD = service_discovery.ValidateAWSData(data, true); errSD != nil {
-			log.Fatal("Error validating AWS instance: " + errSD.Error())
-		}
-		if errSD = discovery.AddNode("aws", *data.ID, data); errSD != nil {
-			log.Warning("Error creating AWS instance: " + errSD.Error())
-		}
+		_ = cfg.SaveConsuls(cfg.ServiceDiscovery.Consuls)
 	}
-	_ = cfg.SaveAWS(cfg.ServiceDiscovery.AWSRegions)
+
+	awsStatus := storageStatus(cfg, dapi_storage.SubsystemAWS)
+	if awsStatus.State == dapi_storage.Unavailable {
+		log.Warningf("aws service discovery is isolated and unavailable: %s", awsStatus.Detail)
+	} else {
+		for _, data := range cfg.ServiceDiscovery.AWSRegions {
+			var errSD error
+			if data.ID == nil || len(*data.ID) == 0 {
+				data.ID = service_discovery.NewServiceDiscoveryUUID()
+			}
+			if errSD = service_discovery.ValidateAWSData(data, true); errSD != nil {
+				log.Fatal("Error validating AWS instance: " + errSD.Error())
+			}
+			if errSD = discovery.AddNode("aws", *data.ID, data); errSD != nil {
+				log.Warning("Error creating AWS instance: " + errSD.Error())
+			}
+		}
+		_ = cfg.SaveAWS(cfg.ServiceDiscovery.AWSRegions)
+	}
 
 	client = resilient.NewClient(client)
 
@@ -218,8 +242,10 @@ func configureAPI(maxBodySize int64) (http.Handler, func()) { //nolint:maintidx
 		ReloadAgent:           ra,
 		ConsulDiscovery:       discovery,
 		ConsulPersistCallback: cfg.SaveConsuls,
+		ConsulWritable:        func() bool { return storageStatus(cfg, dapi_storage.SubsystemConsul).State.Writable() },
 		AWSDiscovery:          discovery,
 		AWSPersistCallback:    cfg.SaveAWS,
+		AWSWritable:           func() bool { return storageStatus(cfg, dapi_storage.SubsystemAWS).State.Writable() },
 		UseValidation:         true,
 		Version:               Version,
 		BuildTime:             BuildTime,

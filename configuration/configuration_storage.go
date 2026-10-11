@@ -326,7 +326,22 @@ func copyConfigurationToStorage(cfg *Configuration) {
 	cfgStorage.LogTargets = &cfg.LogTargets
 }
 
-func (cfgStorage *StorageDataplaneAPIConfiguration) emptyDeprecatedSections() {
-	// Remove ServiceDiscovery Consuls and AWS Regions
-	cfgStorage.DeprecatedServiceDiscovery = nil
+// emptyMigratedSections removes the deprecated service_discovery
+// sub-sections whose contents have actually been persisted to the new
+// state files. A sub-section whose migration was skipped (isolated state
+// store) is kept in place so its credentials are not silently erased.
+func (cfgStorage *StorageDataplaneAPIConfiguration) emptyMigratedSections(consuls, awsRegions bool) {
+	sd := cfgStorage.DeprecatedServiceDiscovery
+	if sd == nil {
+		return
+	}
+	if consuls {
+		sd.Consuls = nil
+	}
+	if awsRegions {
+		sd.AWSRegions = nil
+	}
+	if sd.Consuls == nil && sd.AWSRegions == nil {
+		cfgStorage.DeprecatedServiceDiscovery = nil
+	}
 }

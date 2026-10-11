@@ -23,40 +23,44 @@ import (
 	"github.com/haproxytech/dataplaneapi/storagetype"
 )
 
+// migrateDeprecatedFields moves Consul/AWS definitions still living in the
+// YAML configuration file into the dedicated state files. It reports, per
+// subsystem, whether the deprecated YAML section is safe to remove: when a
+// state store is isolated or a write cannot be committed, its YAML section
+// is intentionally preserved so credentials are never silently lost.
 func (c *Configuration) migrateDeprecatedFields() ([]string, error) {
 	deprecationInfoMsg := make([]string, 0)
 
-	// Service Discovery Consuls
-	deprMsgConsuls, err := c.migrateSDConsuls()
-	deprecationInfoMsg = append(deprecationInfoMsg, deprMsgConsuls...)
+	consulsMigrated, msgs, err := c.migrateSDConsuls()
+	deprecationInfoMsg = append(deprecationInfoMsg, msgs...)
 	if err != nil {
 		return deprecationInfoMsg, err
 	}
 
-	// Service Discovery AWS Regions
-	deprMsgAwsRegions, err := c.migrateSDAwsRegions()
-	deprecationInfoMsg = append(deprecationInfoMsg, deprMsgAwsRegions...)
+	awsMigrated, msgs, err := c.migrateSDAwsRegions()
+	deprecationInfoMsg = append(deprecationInfoMsg, msgs...)
 	if err != nil {
 		return deprecationInfoMsg, err
 	}
 
-	// Remove deprecated fields after migration
-	c.storage.Get().emptyDeprecatedSections()
+	c.storage.Get().emptyMigratedSections(consulsMigrated, awsMigrated)
 
 	return deprecationInfoMsg, nil
 }
 
-func (c *Configuration) migrateSDConsuls() ([]string, error) {
+func (c *Configuration) migrateSDConsuls() (bool, []string, error) {
 	deprecationInfoMsg := make([]string, 0)
 
 	dapiCfgStorage := c.storage.Get()
 	dapiStorageConsuls := c.sdConsulStorage.GetConsuls()
 	consulsStoragePath := path.Join(c.HAProxy.DataplaneStorageDir, storage.ConsulFileName)
 
-	consulsToMigrate := make(storagetype.Consuls, 0)
 	if dapiCfgStorage.DeprecatedServiceDiscovery == nil || dapiCfgStorage.DeprecatedServiceDiscovery.Consuls == nil {
-		return deprecationInfoMsg, nil
+		// Nothing to preserve in the YAML for this subsystem.
+		return true, deprecationInfoMsg, nil
 	}
+
+	consulsToMigrate := make(storagetype.Consuls, 0)
 	for _, cfgConsul := range *dapiCfgStorage.DeprecatedServiceDiscovery.Consuls {
 		found := false
 		// Check done on ID
@@ -93,24 +97,37 @@ func (c *Configuration) migrateSDConsuls() ([]string, error) {
 			consulsToMigrate = append(consulsToMigrate, cfgConsul)
 		}
 	}
+	if len(consulsToMigrate) > 0 && !c.sdConsulStorage.Status().State.Writable() {
+		deprecationInfoMsg = append(deprecationInfoMsg,
+			fmt.Sprintf("[CFG DEPRECATED] [SKIP] [Consul]: consul state is %s, %d definition(s) remain in %s and will be retried on next start",
+				c.sdConsulStorage.Status().State, len(consulsToMigrate), c.HAProxy.DataplaneConfig))
+		return false, deprecationInfoMsg, nil
+	}
 	if err := c.sdConsulStorage.AddConsulsAndStore(consulsToMigrate); err != nil {
-		return deprecationInfoMsg, err
+		if isDegradedStorageError(err) {
+			deprecationInfoMsg = append(deprecationInfoMsg,
+				fmt.Sprintf("[CFG DEPRECATED] [SKIP] [Consul]: migration write was not committed (%v); definitions remain in %s and will be retried on next start",
+					err, c.HAProxy.DataplaneConfig))
+			return false, deprecationInfoMsg, nil
+		}
+		return false, deprecationInfoMsg, err
 	}
 	c.ServiceDiscovery.Consuls = append(c.ServiceDiscovery.Consuls, consulsToMigrate...)
-	return deprecationInfoMsg, nil
+	return true, deprecationInfoMsg, nil
 }
 
-func (c *Configuration) migrateSDAwsRegions() ([]string, error) {
+func (c *Configuration) migrateSDAwsRegions() (bool, []string, error) {
 	deprecationInfoMsg := make([]string, 0)
 
 	dapiCfgStorage := c.storage.Get()
 	dapiStorageAwsRegions := c.sdAWSRegionStorage.GetAWSRegions()
 	awsRegionsStoragePath := path.Join(c.HAProxy.DataplaneStorageDir, storage.AWSRegionFileName)
 
-	awsRegionssToMigrate := make(storagetype.AWSRegions, 0)
 	if dapiCfgStorage.DeprecatedServiceDiscovery == nil || dapiCfgStorage.DeprecatedServiceDiscovery.AWSRegions == nil {
-		return deprecationInfoMsg, nil
+		return true, deprecationInfoMsg, nil
 	}
+
+	awsRegionsToMigrate := make(storagetype.AWSRegions, 0)
 	for _, cfgAwsRegion := range *dapiCfgStorage.DeprecatedServiceDiscovery.AWSRegions {
 		found := false
 		for _, dapiStorageAwsRegion := range dapiStorageAwsRegions {
@@ -143,12 +160,24 @@ func (c *Configuration) migrateSDAwsRegions() ([]string, error) {
 			// Logging is not done here as at startup, the logger is not yet initialized
 			// so it's done later on
 			deprecationInfoMsg = append(deprecationInfoMsg, msg)
-			awsRegionssToMigrate = append(awsRegionssToMigrate, cfgAwsRegion)
+			awsRegionsToMigrate = append(awsRegionsToMigrate, cfgAwsRegion)
 		}
 	}
-	if err := c.sdAWSRegionStorage.AddAWSRegionsAndStore(awsRegionssToMigrate); err != nil {
-		return deprecationInfoMsg, err
+	if len(awsRegionsToMigrate) > 0 && !c.sdAWSRegionStorage.Status().State.Writable() {
+		deprecationInfoMsg = append(deprecationInfoMsg,
+			fmt.Sprintf("[CFG DEPRECATED] [SKIP] [AWS Region]: aws state is %s, %d definition(s) remain in %s and will be retried on next start",
+				c.sdAWSRegionStorage.Status().State, len(awsRegionsToMigrate), c.HAProxy.DataplaneConfig))
+		return false, deprecationInfoMsg, nil
 	}
-	c.ServiceDiscovery.AWSRegions = append(c.ServiceDiscovery.AWSRegions, awsRegionssToMigrate...)
-	return deprecationInfoMsg, nil
+	if err := c.sdAWSRegionStorage.AddAWSRegionsAndStore(awsRegionsToMigrate); err != nil {
+		if isDegradedStorageError(err) {
+			deprecationInfoMsg = append(deprecationInfoMsg,
+				fmt.Sprintf("[CFG DEPRECATED] [SKIP] [AWS Region]: migration write was not committed (%v); definitions remain in %s and will be retried on next start",
+					err, c.HAProxy.DataplaneConfig))
+			return false, deprecationInfoMsg, nil
+		}
+		return false, deprecationInfoMsg, err
+	}
+	c.ServiceDiscovery.AWSRegions = append(c.ServiceDiscovery.AWSRegions, awsRegionsToMigrate...)
+	return true, deprecationInfoMsg, nil
 }

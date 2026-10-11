@@ -1,68 +1,62 @@
 package storage
 
 import (
-	"log"
-	"os"
 	"path/filepath"
-
-	"github.com/google/renameio"
-	native_misc "github.com/haproxytech/client-native/v6/misc"
-	jsoniter "github.com/json-iterator/go"
 )
 
+// fileStorage is the thin adapter over the durable, generational engine.
+// The filePath-only struct literal is kept compatible with existing
+// callers/tests; the engine itself is registered once per absolute path
+// and shared by every adapter pointing at it.
 type fileStorage[T Storable] struct {
 	filePath string
 }
 
+// newFileStorage builds a fileStorage for the given path.
+func newFileStorage[T Storable](filePath string) *fileStorage[T] {
+	return &fileStorage[T]{filePath: filePath}
+}
+
+// subsystemNameFor derives the stable subsystem identifier from the
+// well-known state file basename. Unknown names fall back to the basename
+// itself.
+func subsystemNameFor(filePath string) string {
+	switch filepath.Base(filePath) {
+	case ClusterModeDataFileName:
+		return SubsystemUsers
+	case filepath.Base(ConsulFileName):
+		return SubsystemConsul
+	case filepath.Base(AWSRegionFileName):
+		return SubsystemAWS
+	default:
+		return filepath.Base(filePath)
+	}
+}
+
+func (f *fileStorage[T]) durable() *durableEngine[T] {
+	return getOrCreateEngine[T](f.filePath, subsystemNameFor(f.filePath))
+}
+
 func (f *fileStorage[T]) Get() (T, error) {
-	returnData := new(T)
-
-	data, err := os.ReadFile(f.filePath)
-	if err != nil {
-		return *returnData, err
-	}
-
-	if len(data) == 0 {
-		return *returnData, nil
-	}
-	json := jsoniter.ConfigFastest
-	if err := json.Unmarshal(data, returnData); err != nil {
-		return *returnData, err
-	}
-
-	return *returnData, nil
+	return f.durable().Reload()
 }
 
 func (f *fileStorage[T]) Store(data T) error {
-	if err := f.initFile(); err != nil {
-		return err
-	}
-	json := jsoniter.ConfigFastest
-	jsonData, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	// may hold the cluster token and service discovery credentials
-	if err = renameio.WriteFile(f.filePath, jsonData, 0o600); err != nil {
-		return err
-	}
-	return nil
+	return f.durable().Store(data)
 }
 
+func (f *fileStorage[T]) Active() T {
+	return f.durable().Active()
+}
+
+func (f *fileStorage[T]) Status() StatusReport {
+	return f.durable().Status()
+}
+
+// initFile keeps the historical name used by the subsystem wrappers:
+// opening a store runs startup recovery and never fatals on a
+// non-writable directory (the conclusion is reported through Status).
 func (f *fileStorage[T]) initFile() error {
-	if _, err := native_misc.CheckOrCreateWritableDirectory(filepath.Dir(f.filePath)); err != nil {
-		log.Fatalf("error initializing dataplane internal storage: %v", err)
-	}
-	if _, err := os.Stat(f.filePath); err != nil {
-		if os.IsNotExist(err) {
-			file, errCreate := os.OpenFile(f.filePath, os.O_CREATE|os.O_WRONLY, 0o600)
-			if errCreate != nil {
-				return errCreate
-			}
-			return file.Close()
-		}
-		return err
-	}
+	f.durable()
 	return nil
 }

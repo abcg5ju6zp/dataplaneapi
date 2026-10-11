@@ -18,6 +18,7 @@ type ClusterModeStorage interface {
 
 	Load() error
 	Store() error
+	Status() StatusReport
 }
 
 type Users interface {
@@ -40,29 +41,26 @@ type clusterModeStorageImpl struct {
 }
 
 // NewClusterModeStorage creates a new clusterModeStorageImpl with initial configuration from a file path.
+// It never fails on a corrupt state file: inspect Status for the independent
+// recovery conclusion (recovered / read-only isolated / unavailable).
 func NewClusterModeStorage(path string) (ClusterModeStorage, error) {
-	fs := &fileStorage[storagetype.ClusterModeData]{path}
-	if err := fs.initFile(); err != nil {
-		return nil, err
-	}
-	clusterStorage, err := fs.Get()
-	if err != nil {
-		return nil, err
-	}
+	fs := newFileStorage[storagetype.ClusterModeData](path)
+	clusterData, _ := fs.Get()
 	return &clusterModeStorageImpl{
 		storage:         fs,
-		ClusterModeData: clusterStorage,
+		ClusterModeData: clusterData,
 	}, nil
+}
+
+func (cs *clusterModeStorageImpl) Status() StatusReport {
+	return cs.storage.Status()
 }
 
 func (cs *clusterModeStorageImpl) Load() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	data, err := cs.load()
-	if err != nil {
-		return err
-	}
+	data, _ := cs.storage.Get()
 	cs.ClusterModeData = data
 
 	return nil
@@ -72,10 +70,7 @@ func (cs *clusterModeStorageImpl) Store() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if err := cs.store(); err != nil {
-		return err
-	}
-	return nil
+	return cs.commit(cs.ClusterModeData.Users)
 }
 
 func (cs *clusterModeStorageImpl) GetUsers() storagetype.Users {
@@ -88,84 +83,49 @@ func (cs *clusterModeStorageImpl) AddUserAndStore(user storagetype.User) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.addUser(user)
-
-	// In case something went wrong whil storing, delete the user from the store
-	if err := cs.store(); err != nil {
-		cs.removeUser(user)
-		return err
-	}
-	return nil
+	candidate := append(slices.Clone(cs.ClusterModeData.Users), user)
+	return cs.commit(candidate)
 }
 
 func (cs *clusterModeStorageImpl) AddUsersAndStore(users storagetype.Users) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.addUsers(users)
-
-	// In case something went wrong whil storing, delete the user from the store
-	if err := cs.store(); err != nil {
-		cs.removeUsers(users)
-		return err
-	}
-	return nil
+	candidate := append(slices.Clone(cs.ClusterModeData.Users), users...)
+	return cs.commit(candidate)
 }
 
 func (cs *clusterModeStorageImpl) ReplaceAllUsersAndStore(users storagetype.Users) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	oldUsers := cs.ClusterModeData.Users
 
-	cs.ClusterModeData.Users = users
-	if err := cs.store(); err != nil {
-		cs.ClusterModeData.Users = oldUsers
-		return err
-	}
-	return nil
+	return cs.commit(slices.Clone(users))
 }
 
 func (cs *clusterModeStorageImpl) RemoveUserAndStore(user storagetype.User) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	cs.removeUser(user)
-
-	// In case something went wrong while storing, add the user to the store
-	if err := cs.store(); err != nil {
-		cs.addUser(user)
-		return err
-	}
-	return nil
-}
-
-func (cs *clusterModeStorageImpl) addUser(user storagetype.User) {
-	cs.ClusterModeData.Users = append(cs.ClusterModeData.Users, user)
-}
-
-func (cs *clusterModeStorageImpl) addUsers(users storagetype.Users) {
-	cs.ClusterModeData.Users = append(cs.ClusterModeData.Users, users...)
-}
-
-func (cs *clusterModeStorageImpl) removeUser(user storagetype.User) {
-	for i, u := range cs.ClusterModeData.Users {
-		if u.Name == user.Name {
-			cs.ClusterModeData.Users = slices.Delete(cs.ClusterModeData.Users, i, i+1)
-			break
+	candidate := make(storagetype.Users, 0, len(cs.ClusterModeData.Users))
+	for _, u := range cs.ClusterModeData.Users {
+		if u.Name != user.Name {
+			candidate = append(candidate, u)
 		}
 	}
+	return cs.commit(candidate)
 }
 
-func (cs *clusterModeStorageImpl) removeUsers(users storagetype.Users) {
-	for _, user := range users {
-		cs.removeUser(user)
+// commit stores the candidate generation and swaps the in-memory active
+// object only after the durable write is verified. On failure the active
+// object converges with the engine's authoritative view (e.g. the
+// restored last known good generation); a failed write never leaves a
+// pending mutation visible.
+func (cs *clusterModeStorageImpl) commit(users storagetype.Users) error {
+	candidate := storagetype.ClusterModeData{Users: users}
+	if err := cs.storage.Store(candidate); err != nil {
+		cs.ClusterModeData = cs.storage.Active()
+		return err
 	}
-}
-
-func (cs *clusterModeStorageImpl) store() error {
-	return cs.storage.Store(cs.ClusterModeData)
-}
-
-func (cs *clusterModeStorageImpl) load() (storagetype.ClusterModeData, error) {
-	return cs.storage.Get()
+	cs.ClusterModeData = candidate
+	return nil
 }
