@@ -32,8 +32,9 @@ func buildCombinedSpec(specDir string) error {
 		Servers: openapi3.Servers{{URL: "/v3"}},
 		Paths:   openapi3.NewPathsWithCapacity(256),
 		Components: &openapi3.Components{
-			Schemas:   make(openapi3.Schemas),
-			Responses: make(openapi3.ResponseBodies),
+			Schemas:    make(openapi3.Schemas),
+			Responses:  make(openapi3.ResponseBodies),
+			Parameters: make(openapi3.ParametersMap),
 			SecuritySchemes: openapi3.SecuritySchemes{
 				"basic_auth": &openapi3.SecuritySchemeRef{
 					Value: &openapi3.SecurityScheme{Type: "http", Scheme: "basic"},
@@ -145,8 +146,9 @@ func mergeAPIPaths(ctx context.Context, loader *openapi3.Loader, specPath string
 
 	if doc.Components == nil {
 		doc.Components = &openapi3.Components{
-			Schemas:   make(openapi3.Schemas),
-			Responses: make(openapi3.ResponseBodies),
+			Schemas:    make(openapi3.Schemas),
+			Responses:  make(openapi3.ResponseBodies),
+			Parameters: make(openapi3.ParametersMap),
 		}
 	}
 
@@ -158,6 +160,9 @@ func mergeAPIPaths(ctx context.Context, loader *openapi3.Loader, specPath string
 		return err
 	}
 	if err := mergeComponents(combined.Components.Responses, doc.Components.Responses, "response", specPath); err != nil {
+		return err
+	}
+	if err := mergeComponents(combined.Components.Parameters, doc.Components.Parameters, "parameter", specPath); err != nil {
 		return err
 	}
 

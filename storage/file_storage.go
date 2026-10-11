@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"log"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -52,7 +52,7 @@ func (f *fileStorage[T]) Store(data T) error {
 
 func (f *fileStorage[T]) initFile() error {
 	if _, err := native_misc.CheckOrCreateWritableDirectory(filepath.Dir(f.filePath)); err != nil {
-		log.Fatalf("error initializing dataplane internal storage: %v", err)
+		return fmt.Errorf("error initializing dataplane internal storage: %w", err)
 	}
 	if _, err := os.Stat(f.filePath); err != nil {
 		if os.IsNotExist(err) {

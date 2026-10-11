@@ -11,132 +11,211 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
 
 package storage
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/haproxytech/client-native/v6/misc"
 	"github.com/haproxytech/dataplaneapi/storagetype"
 	"github.com/stretchr/testify/require"
 )
 
-func TestAddUser(t *testing.T) {
-	tests := []struct {
-		name string
-	}{
-		{
-			name: "add 1 user",
+func TestCommit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ClusterModeDataFileName)
+	clusterStorage, err := NewClusterModeStorage(path)
+	require.NoError(t, err)
+
+	next := storagetype.ClusterModeData{
+		Users:      getSetupUsers(),
+		Generation: 1,
+		Journal: storagetype.Journal{
+			{
+				ID:               "op-1",
+				Kind:             storagetype.OpAdd,
+				Username:         "user2",
+				PasswordHash:     "$6$salt$hash",
+				BaseGeneration:   0,
+				ResultGeneration: 1,
+				Status:           storagetype.StatusPersisted,
+				Timestamp:        time.Now().UTC(),
+			},
 		},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			clusterStoragePath := filepath.Join(dir, ClusterModeDataFileName)
+	require.NoError(t, clusterStorage.Commit(next))
 
-			// create log store with initial configuration
-			fs := &fileStorage[storagetype.ClusterModeData]{clusterStoragePath}
-			users := setup(t, fs)
-			clusterStorage, err := NewClusterModeStorage(clusterStoragePath)
-			require.NoError(t, err)
+	// in-memory state matches the committed document (deeply)
+	require.Equal(t, next, clusterStorage.Current())
 
-			// apply change on users slice
-			addUser(&users)
+	// durable state survives a fresh load
+	reloaded, err := NewClusterModeStorage(path)
+	require.NoError(t, err)
+	require.Equal(t, storagetype.StatusPersisted, reloaded.Current().Journal[0].Status)
 
-			// now add this user to storage
-			err = clusterStorage.AddUserAndStore(userToAdd())
-			require.NoError(t, err, "failed to add user")
+	// file keeps restrictive permissions
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
 
-			// check change has been applied
-			require.Equal(t, users, clusterStorage.GetUsers())
-			// reload storage and check
-			err = clusterStorage.Load()
-			require.NoError(t, err, "failed to load users")
-			require.Equal(t, users, clusterStorage.GetUsers())
-		})
+func TestCommitWriteFailureKeepsOldState(t *testing.T) {
+	initial := storagetype.ClusterModeData{
+		Users:      getSetupUsers(),
+		Generation: 3,
+	}
+	backend := &fakeClusterBackend{data: initial}
+	cs := &clusterModeStorageImpl{storage: backend, ClusterModeData: initial}
+
+	next := storagetype.ClusterModeData{
+		Users:      append(getSetupUsers(), userToAdd()),
+		Generation: 4,
+		Journal: storagetype.Journal{{
+			ID: "op-fail", Kind: storagetype.OpAdd, ResultGeneration: 4, Status: storagetype.StatusPersisted,
+		}},
+	}
+	backend.fail = true
+	err := cs.Commit(next)
+	var persistErr *PersistError
+	require.ErrorAs(t, err, &persistErr)
+	require.Equal(t, "op-fail", persistErr.OperationID)
+
+	// old durable state is fully intact in memory
+	require.Equal(t, initial, cs.Current())
+	require.Equal(t, getSetupUsers(), cs.GetUsers())
+}
+
+func TestCommitAfterFailureSucceedsOnRetry(t *testing.T) {
+	initial := storagetype.ClusterModeData{Users: getSetupUsers(), Generation: 1}
+	backend := &fakeClusterBackend{data: initial, fail: true}
+	cs := &clusterModeStorageImpl{storage: backend, ClusterModeData: initial}
+
+	next := storagetype.ClusterModeData{Users: append(getSetupUsers(), userToAdd()), Generation: 2}
+	require.Error(t, cs.Commit(next))
+
+	backend.fail = false
+	require.NoError(t, cs.Commit(next))
+	require.Equal(t, next, cs.Current())
+}
+
+func TestCurrentIsDeepCopy(t *testing.T) {
+	data := storagetype.ClusterModeData{
+		Users:      getSetupUsers(),
+		Generation: 2,
+		Journal: storagetype.Journal{
+			{ID: "op", Kind: storagetype.OpDelete, Status: storagetype.StatusPublished},
+		},
+	}
+	cs := &clusterModeStorageImpl{ClusterModeData: data}
+
+	view := cs.Current()
+	view.Users[0].Name = "mutated"
+	*view.Users[1].Password = "mutated"
+	view.Journal[0].Status = storagetype.StatusPersisted
+	view.Generation = 99
+
+	again := cs.Current()
+	require.Equal(t, "admin", again.Users[0].Name)
+	require.Equal(t, "user1", *again.Users[1].Password)
+	require.Equal(t, storagetype.StatusPublished, again.Journal[0].Status)
+	require.Equal(t, uint64(2), again.Generation)
+}
+
+func TestLoadNormalizesLegacyGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ClusterModeDataFileName)
+	fs := &fileStorage[storagetype.ClusterModeData]{path}
+	require.NoError(t, fs.Store(storagetype.ClusterModeData{Users: getSetupUsers()})) // legacy shape, no generation
+
+	clusterStorage, err := NewClusterModeStorage(path)
+	require.NoError(t, err)
+	require.NoError(t, clusterStorage.Load())
+	require.Equal(t, uint64(1), clusterStorage.Current().Generation)
+
+	// an empty legacy file stays at generation 0
+	emptyPath := filepath.Join(t.TempDir(), ClusterModeDataFileName)
+	emptyStorage, err := NewClusterModeStorage(emptyPath)
+	require.NoError(t, err)
+	require.NoError(t, emptyStorage.Load())
+	require.Equal(t, uint64(0), emptyStorage.Current().Generation)
+}
+
+func TestReconcileFlipsPersistedEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ClusterModeDataFileName)
+	fs := &fileStorage[storagetype.ClusterModeData]{path}
+	require.NoError(t, fs.initFile())
+
+	// legacy users without generation + one entry left "persisted" by a crash
+	legacy := storagetype.ClusterModeData{
+		Users: getSetupUsers(),
+		Journal: storagetype.Journal{
+			{ID: "op-old", Kind: storagetype.OpAdd, ResultGeneration: 1, Status: storagetype.StatusPublished},
+			{ID: "op-new", Kind: storagetype.OpRotate, ResultGeneration: 2, Status: storagetype.StatusPersisted},
+		},
+	}
+	require.NoError(t, fs.Store(legacy))
+
+	clusterStorage, err := NewClusterModeStorage(path)
+	require.NoError(t, err)
+
+	data, err := clusterStorage.Reconcile()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), data.Generation) // legacy normalization
+	for _, e := range data.Journal {
+		require.Equal(t, storagetype.StatusPublished, e.Status, "entry %s not reconciled", e.ID)
+	}
+
+	// the reconciliation was durably rewritten
+	reloaded, err := fs.Get()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), reloaded.Generation)
+	for _, e := range reloaded.Journal {
+		require.Equal(t, storagetype.StatusPublished, e.Status)
 	}
 }
 
-func TestRemoveUser(t *testing.T) {
-	tests := []struct {
-		name string
-	}{
-		{
-			name: "remove one user",
+func TestReconcileRewriteFailureStillReturnsNormalizedData(t *testing.T) {
+	backend := &fakeClusterBackend{
+		data: storagetype.ClusterModeData{
+			Users:   getSetupUsers(),
+			Journal: storagetype.Journal{{ID: "op", Status: storagetype.StatusPersisted}},
 		},
+		fail: true,
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			clusterStoragePath := filepath.Join(dir, ClusterModeDataFileName)
-
-			// create log store with initial configuration
-			fs := &fileStorage[storagetype.ClusterModeData]{clusterStoragePath}
-			users := setup(t, fs)
-			clusterStorage, err := NewClusterModeStorage(clusterStoragePath)
-			require.NoError(t, err)
-
-			// apply change on users slice
-			removeUser(&users)
-
-			// now add this user to storage
-			err = clusterStorage.RemoveUserAndStore(userToRemove())
-			require.NoError(t, err, "failed to remove user")
-
-			// check change has been applied
-			require.Equal(t, users, clusterStorage.GetUsers())
-			// reload storage and check
-			err = clusterStorage.Load()
-			require.NoError(t, err, "failed to load users")
-			require.Equal(t, users, clusterStorage.GetUsers())
-		})
+	cs := &clusterModeStorageImpl{
+		storage:         backend,
+		ClusterModeData: backend.data,
 	}
+	data, err := cs.Reconcile()
+	require.Error(t, err)
+	require.Equal(t, uint64(1), data.Generation)
+	require.Equal(t, storagetype.StatusPublished, data.Journal[0].Status)
+	// in-memory state is normalized even though the rewrite failed
+	require.Equal(t, data, cs.Current())
 }
 
-func TestReplaceAllUsers(t *testing.T) {
-	tests := []struct {
-		name string
-	}{
-		{
-			name: "replace all users",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			clusterStoragePath := filepath.Join(dir, ClusterModeDataFileName)
-
-			// create log store with initial configuration
-			fs := &fileStorage[storagetype.ClusterModeData]{clusterStoragePath}
-			_ = setup(t, fs)
-			clusterStorage, err := NewClusterModeStorage(clusterStoragePath)
-			require.NoError(t, err)
-
-			// now add this user to storage
-			err = clusterStorage.ReplaceAllUsersAndStore(usersToReplace())
-			require.NoError(t, err, "failed to replace all users")
-
-			// check change has been applied
-			require.Equal(t, usersToReplace(), clusterStorage.GetUsers())
-			// reload storage and check
-			err = clusterStorage.Load()
-			require.NoError(t, err, "failed to load users")
-			require.Equal(t, usersToReplace(), clusterStorage.GetUsers())
-		})
-	}
+type fakeClusterBackend struct {
+	data storagetype.ClusterModeData
+	fail bool
 }
 
-func setup(t *testing.T, fs *fileStorage[storagetype.ClusterModeData]) storagetype.Users {
-	t.Helper()
-	users := getSetupUsers()
-	clusterMode := storagetype.ClusterModeData{
-		Users: users,
+func (f *fakeClusterBackend) Get() (storagetype.ClusterModeData, error) {
+	return f.data, nil
+}
+
+func (f *fakeClusterBackend) Store(data storagetype.ClusterModeData) error {
+	if f.fail {
+		return errors.New("disk full")
 	}
-	err := fs.Store(clusterMode)
-	require.NoError(t, err, "failed to write setup users")
-	return users
+	f.data = data
+	return nil
 }
 
 func getSetupUsers() storagetype.Users {
@@ -156,38 +235,10 @@ func getSetupUsers() storagetype.Users {
 	}
 }
 
-func addUser(users *storagetype.Users) {
-	*users = append(*users, userToAdd())
-}
-
-func removeUser(users *storagetype.Users) {
-	*users = (*users)[:len(*users)-1]
-}
-
 func userToAdd() storagetype.User {
 	return storagetype.User{
 		Name:     "useradded",
 		Password: misc.StringP("useradded"),
 		Insecure: misc.BoolP(true),
-	}
-}
-
-func userToRemove() storagetype.User {
-	return storagetype.User{
-		Name:     "user2",
-		Password: misc.StringP("user2"),
-	}
-}
-
-func usersToReplace() storagetype.Users {
-	return storagetype.Users{
-		storagetype.User{
-			Name:     "toreplace1",
-			Password: misc.StringP("toreplace1"),
-		},
-		storagetype.User{
-			Name:     "toreplace2",
-			Password: misc.StringP("replace2"),
-		},
 	}
 }

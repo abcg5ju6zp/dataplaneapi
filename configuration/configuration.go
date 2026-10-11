@@ -29,7 +29,6 @@ import (
 	"github.com/haproxytech/client-native/v6/models"
 	"github.com/haproxytech/dataplaneapi/log"
 	"github.com/haproxytech/dataplaneapi/storage"
-	"github.com/haproxytech/dataplaneapi/storagetype"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -158,31 +157,6 @@ func (c *Configuration) GetStorageData() *StorageDataplaneAPIConfiguration {
 
 func (c *Configuration) GetClusterModeStorage() storage.ClusterModeStorage {
 	return c.clusterModeStorage
-}
-
-func (c *Configuration) GetUsers() storagetype.Users {
-	// Users persisted in the dataplane storage file...
-	users := c.clusterModeStorage.GetUsers()
-	// ...merged with users defined in the configuration file.
-	for _, user := range c.Users {
-		found := false
-		for _, cmUser := range users {
-			if cmUser.Name == user.Name {
-				found = true
-				break
-			}
-		}
-		pwd := user.Password
-		insecure := user.Insecure
-		if !found {
-			users = append(users, storagetype.User{
-				Name:     user.Name,
-				Password: &pwd,
-				Insecure: &insecure,
-			})
-		}
-	}
-	return users
 }
 
 func (c *Configuration) UnSubscribeAll() {

@@ -16,7 +16,12 @@
 package storagetype
 
 // ClusterModeData is the on-disk content of the dataplane storage file
-// (historically cluster.json); it now only holds dataplane-managed users.
+// (historically cluster.json); it holds dataplane-managed users together with
+// the user-set generation, the bounded idempotency journal and the most
+// recent diagnosable failure.
 type ClusterModeData struct {
-	Users Users `json:"users,omitempty"`
+	Users       Users          `json:"users,omitempty"`
+	Generation  uint64         `json:"generation,omitempty"`
+	Journal     Journal        `json:"journal,omitempty"`
+	LastFailure *FailureRecord `json:"last_failure,omitempty"`
 }

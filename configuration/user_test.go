@@ -19,21 +19,31 @@ import (
 	"testing"
 	"time"
 
-	// register the SHA-256 crypt implementation, as the main package does
+	// register crypt implementations used by the auth path under test
 	_ "github.com/GehirnInc/crypt/sha256_crypt"
 	_ "github.com/GehirnInc/crypt/sha512_crypt"
 	"github.com/haproxytech/client-native/v6/config-parser/types"
 )
 
+// publishTestSnapshot replaces the active snapshot with one built directly
+// from the given users, mimicking a published generation.
+func publishTestSnapshot(store *Users, users []types.User) {
+	snap := &authSnapshot{generation: 1, configNames: map[string]struct{}{}}
+	for _, user := range users {
+		snap.users = append(snap.users, user)
+	}
+	store.current.Store(snap)
+}
+
 func TestAuthenticateUser(t *testing.T) {
 	store := GetUsersStore()
-	saved := store.users
-	t.Cleanup(func() { store.users = saved })
-	store.users = []types.User{
+	saved := store.current.Load()
+	t.Cleanup(func() { store.current.Store(saved) })
+	publishTestSnapshot(store, []types.User{
 		{Name: "insecure_user", Password: "plainpass", IsInsecure: true},
 		// SHA-256 crypt of "secretpass"
 		{Name: "crypted_user", Password: "$5$testsalt$eCSeYT8Aub0tlGnCdlCmGO4RrnbXQZlcDzFHJWzOPa6"},
-	}
+	})
 
 	tests := []struct {
 		name    string
@@ -61,9 +71,9 @@ func TestAuthenticateUser(t *testing.T) {
 
 func TestAuthenticateUserNoConfiguredUsers(t *testing.T) {
 	store := GetUsersStore()
-	saved := store.users
-	t.Cleanup(func() { store.users = saved })
-	store.users = nil
+	saved := store.current.Load()
+	t.Cleanup(func() { store.current.Store(saved) })
+	store.current.Store(&authSnapshot{})
 
 	if _, err := AuthenticateUser("anyone", "anything"); err == nil {
 		t.Error("AuthenticateUser succeeded with an empty user store")
@@ -73,11 +83,11 @@ func TestAuthenticateUserNoConfiguredUsers(t *testing.T) {
 // Failing logins must take comparable time for known and unknown users.
 func TestAuthenticateUser_NoUserEnumerationByTiming(t *testing.T) {
 	store := GetUsersStore()
-	saved := store.users
-	t.Cleanup(func() { store.users = saved })
-	store.users = []types.User{
+	saved := store.current.Load()
+	t.Cleanup(func() { store.current.Store(saved) })
+	publishTestSnapshot(store, []types.User{
 		{Name: "crypted_user", Password: "$5$testsalt$eCSeYT8Aub0tlGnCdlCmGO4RrnbXQZlcDzFHJWzOPa6"},
-	}
+	})
 	measure := func(user string) time.Duration {
 		start := time.Now()
 		for range 50 {

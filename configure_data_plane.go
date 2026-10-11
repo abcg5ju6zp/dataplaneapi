@@ -225,6 +225,7 @@ func configureAPI(maxBodySize int64) (http.Handler, func()) { //nolint:maintidx
 		BuildTime:             BuildTime,
 		SystemInfo:            haproxyOptions.ShowSystemInfo,
 		MaxOpenTransactions:   int(cfg.HAProxy.MaxOpenTransactions),
+		APIUserStore:          users,
 		SwaggerJSON:           SwaggerJSON,
 	}
 	chiRouter, err := handlers.NewRouter(opts)
@@ -504,7 +505,9 @@ func reloadConfigurationFile(client client_native.HAProxyClient, haproxyOptions 
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	if err := users.Init(); err != nil {
+	// Rebuild only the configuration-file user overlay; managed users, their
+	// generation and the journal must not change on a config reload.
+	if err := users.ReloadOverlay(); err != nil {
 		log.Fatal(err.Error())
 	}
 	log.Info("Rereading Configuration Files")

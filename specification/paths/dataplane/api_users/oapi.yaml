@@ -1,0 +1,287 @@
+openapi: 3.0.1
+info:
+  title: HAProxy Data Plane API - API Users
+  description: |
+    Manage the local users that can authenticate against the Data Plane API.
+    Managed users are persisted atomically in the dataplane storage file
+    together with a monotonically increasing user-set generation.
+servers:
+  - url: /v3
+tags:
+  - name: API Users
+components:
+  parameters:
+    operation_id:
+      name: operation_id
+      in: query
+      description: |
+        Stable client-generated identity of the change (UUID). The same value
+        makes a retried request idempotent: a response lost after the change
+        was persisted returns the original result instead of applying the
+        change again (in particular, a password rotation is never repeated).
+        Deduplication covers the most recent 100 operations.
+      required: true
+      schema:
+        type: string
+        format: uuid
+    generation:
+      name: generation
+      in: query
+      description: |
+        The user-set generation the change is based on, read from a previous
+        GET of the user collection. A mismatch with the current generation is
+        rejected with 409 so that an older operation cannot overwrite a newer
+        result. Use 0 on an empty user set. Ignored for idempotent replays.
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+  schemas:
+    api_user:
+      type: object
+      required:
+        - username
+        - source
+      properties:
+        username:
+          type: string
+        source:
+          type: string
+          enum: [managed, config]
+          description: managed users live in the dataplane storage file; config users come from the configuration file or HAProxy userlist and cannot be modified through this API.
+    api_users:
+      type: object
+      required:
+        - generation
+        - users
+      properties:
+        generation:
+          type: integer
+          format: int64
+          minimum: 0
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/api_user'
+        last_failure:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/api_user_last_failure'
+    api_user_last_failure:
+      type: object
+      required:
+        - operation_id
+        - phase
+        - message
+        - generation
+        - timestamp
+      properties:
+        operation_id:
+          type: string
+        phase:
+          type: string
+          enum: [persist, publish, reconcile]
+        message:
+          type: string
+        generation:
+          type: integer
+          format: int64
+        timestamp:
+          type: string
+          format: date-time
+    api_user_create:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          minLength: 1
+        password:
+          type: string
+          minLength: 1
+          description: Plaintext initial password; it is hashed server-side with SHA-512 crypt and never persisted or logged in plaintext.
+    api_user_password:
+      type: object
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          minLength: 1
+          description: New plaintext password; it is hashed server-side with SHA-512 crypt and never persisted or logged in plaintext.
+    api_user_operation:
+      type: object
+      required:
+        - operation_id
+        - generation
+        - status
+        - username
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        generation:
+          type: integer
+          format: int64
+          description: Generation resulting from the operation; for a replayed request this is the original operation's generation, not the current one.
+        status:
+          type: string
+          enum: [committed, replayed]
+        username:
+          type: string
+paths:
+  /services/haproxy/api_users:
+    get:
+      summary: Return API users and the current user-set generation
+      description: Returns managed users (from the dataplane storage file) and users provided by the configuration file. Credentials are never returned.
+      operationId: getAPIUsers
+      tags:
+        - API Users
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api_users'
+        '503':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+        'default':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+    post:
+      summary: Create a managed API user
+      description: |
+        Creates a managed user atomically: the password is hashed, the new
+        user set is persisted under generation+1, and only then is the active
+        authentication snapshot replaced. On any persistence failure the
+        previous users and credentials stay in effect and the request can be
+        retried with the same operation_id.
+      operationId: createAPIUser
+      tags:
+        - API Users
+      parameters:
+        - $ref: '#/components/parameters/operation_id'
+        - $ref: '#/components/parameters/generation'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/api_user_create'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api_user_operation'
+        '400':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/BadRequest'
+        '409':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/AlreadyExists'
+        '503':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+        'default':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+      x-codegen-request-body-name: data
+  /services/haproxy/api_users/{username}:
+    get:
+      summary: Return one API user
+      operationId: getOneAPIUser
+      tags:
+        - API Users
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api_user'
+        '404':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/NotFound'
+        '503':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+        'default':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+    delete:
+      summary: Delete a managed API user
+      description: Deletes a managed user under the same atomic generation commit rule as creation.
+      operationId: deleteAPIUser
+      tags:
+        - API Users
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/operation_id'
+        - $ref: '#/components/parameters/generation'
+      responses:
+        '200':
+          description: User deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api_user_operation'
+        '400':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/AlreadyExists'
+        '503':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+        'default':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+  /services/haproxy/api_users/{username}/password:
+    put:
+      summary: Rotate the password of a managed API user
+      description: |
+        Replaces the password under the same atomic generation commit rule.
+        Retrying a request whose response was lost (same operation_id) returns
+        the original result and never rotates the password a second time.
+      operationId: replaceAPIUserPassword
+      tags:
+        - API Users
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/operation_id'
+        - $ref: '#/components/parameters/generation'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/api_user_password'
+      responses:
+        '200':
+          description: Password rotated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/api_user_operation'
+        '400':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/BadRequest'
+        '404':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/NotFound'
+        '409':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/AlreadyExists'
+        '503':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+        'default':
+          $ref: '../../../models/common/responses/models.yaml#/components/responses/DefaultError'
+      x-codegen-request-body-name: data

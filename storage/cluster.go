@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"slices"
 	"sync"
 
@@ -11,26 +12,47 @@ const (
 	ClusterModeDataFileName = "cluster.json"
 )
 
-// ClusterModeStorage persists dataplane-managed users in the dataplane storage
-// file (historically cluster.json).
-type ClusterModeStorage interface {
-	Users
-
-	Load() error
-	Store() error
+// PersistError marks a durable-write failure. The in-memory state is
+// guaranteed unchanged when it is returned, so the caller may keep serving
+// with the old snapshot and the client can safely retry the same operation.
+type PersistError struct {
+	OperationID string
+	Err         error
 }
 
-type Users interface {
-	// GetUsers does not load the users from the storage. Use Load() to load the users if needed.
+func (e *PersistError) Error() string {
+	return fmt.Sprintf("failed to persist API user operation %q: %v", e.OperationID, e.Err)
+}
+
+func (e *PersistError) Unwrap() error {
+	return e.Err
+}
+
+// ClusterModeStorage persists dataplane-managed users in the dataplane
+// storage file (historically cluster.json).
+//
+// The only mutation primitive is Commit: the complete next document is
+// durably and atomically written first, and the in-memory state is swapped
+// only after the write succeeds. In-memory state therefore never diverges
+// from the durable state.
+type ClusterModeStorage interface {
+	// Load reads the storage file into memory.
+	Load() error
+	// Current returns a deep copy of the durable in-memory state.
+	Current() storagetype.ClusterModeData
+	// Commit atomically persists next and, on success, replaces the
+	// in-memory state with it. On failure nothing in memory changes and a
+	// *PersistError is returned.
+	Commit(next storagetype.ClusterModeData) error
+	// Reconcile normalizes a loaded document at startup: legacy files with
+	// users but no generation get generation 1, and journal entries left in
+	// "persisted" state by a crash between durable write and snapshot
+	// publication are flipped to "published". When normalization changes the
+	// document it is best-effort rewritten; the normalized data is returned
+	// regardless of that rewrite's outcome, together with the rewrite error.
+	Reconcile() (storagetype.ClusterModeData, error)
+	// GetUsers returns the durable managed users.
 	GetUsers() storagetype.Users
-	// AddUsersAndStore adds a list of users to the storage and stores in the storage file.
-	AddUsersAndStore(users storagetype.Users) error
-	// AddUserAndStore adds a new user to the storage and stores in the storage file.
-	AddUserAndStore(user storagetype.User) error
-	// RemoveUserAndStore removes a user from the storage and stores in the storage file.
-	RemoveUserAndStore(user storagetype.User) error
-	// ReplaceAllUsersAndStore replaces the list of users in the storage and stores in the storage file.
-	ReplaceAllUsersAndStore(users storagetype.Users) error
 }
 
 type clusterModeStorageImpl struct {
@@ -59,113 +81,143 @@ func (cs *clusterModeStorageImpl) Load() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	data, err := cs.load()
+	data, err := cs.storage.Get()
 	if err != nil {
 		return err
 	}
-	cs.ClusterModeData = data
+	cs.ClusterModeData = normalize(data)
 
 	return nil
 }
 
-func (cs *clusterModeStorageImpl) Store() error {
+func (cs *clusterModeStorageImpl) Current() storagetype.ClusterModeData {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return cloneData(cs.ClusterModeData)
+}
+
+func (cs *clusterModeStorageImpl) Commit(next storagetype.ClusterModeData) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if err := cs.store(); err != nil {
-		return err
+	if err := cs.storage.Store(next); err != nil {
+		// Intentionally keep the previous in-memory state untouched: the
+		// durable write is atomic (rename), and swap happens only after it
+		// succeeds.
+		return &PersistError{OperationID: lastOperationID(next), Err: err}
 	}
+	cs.ClusterModeData = cloneData(next)
 	return nil
+}
+
+func (cs *clusterModeStorageImpl) Reconcile() (storagetype.ClusterModeData, error) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	normalized := normalize(cs.ClusterModeData)
+	changed := !equalData(cs.ClusterModeData, normalized)
+	if changed {
+		if err := cs.storage.Store(normalized); err != nil {
+			// Keep the normalized in-memory state even if the rewrite failed:
+			// auth still works and the next successful commit converges the
+			// file.
+			cs.ClusterModeData = normalized
+			return cloneData(normalized), err
+		}
+		cs.ClusterModeData = normalized
+	}
+	return cloneData(normalized), nil
 }
 
 func (cs *clusterModeStorageImpl) GetUsers() storagetype.Users {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	return cs.ClusterModeData.Users
+	return cloneUsers(cs.ClusterModeData.Users)
 }
 
-func (cs *clusterModeStorageImpl) AddUserAndStore(user storagetype.User) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	cs.addUser(user)
-
-	// In case something went wrong whil storing, delete the user from the store
-	if err := cs.store(); err != nil {
-		cs.removeUser(user)
-		return err
+// normalize applies backward-compatible rules to a loaded document.
+func normalize(data storagetype.ClusterModeData) storagetype.ClusterModeData {
+	out := cloneData(data)
+	if out.Generation == 0 && len(out.Users) > 0 {
+		// Legacy file written before generations existed: its materialized
+		// user set is generation 1.
+		out.Generation = 1
 	}
-	return nil
-}
-
-func (cs *clusterModeStorageImpl) AddUsersAndStore(users storagetype.Users) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	cs.addUsers(users)
-
-	// In case something went wrong whil storing, delete the user from the store
-	if err := cs.store(); err != nil {
-		cs.removeUsers(users)
-		return err
-	}
-	return nil
-}
-
-func (cs *clusterModeStorageImpl) ReplaceAllUsersAndStore(users storagetype.Users) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	oldUsers := cs.ClusterModeData.Users
-
-	cs.ClusterModeData.Users = users
-	if err := cs.store(); err != nil {
-		cs.ClusterModeData.Users = oldUsers
-		return err
-	}
-	return nil
-}
-
-func (cs *clusterModeStorageImpl) RemoveUserAndStore(user storagetype.User) error {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
-	cs.removeUser(user)
-
-	// In case something went wrong while storing, add the user to the store
-	if err := cs.store(); err != nil {
-		cs.addUser(user)
-		return err
-	}
-	return nil
-}
-
-func (cs *clusterModeStorageImpl) addUser(user storagetype.User) {
-	cs.ClusterModeData.Users = append(cs.ClusterModeData.Users, user)
-}
-
-func (cs *clusterModeStorageImpl) addUsers(users storagetype.Users) {
-	cs.ClusterModeData.Users = append(cs.ClusterModeData.Users, users...)
-}
-
-func (cs *clusterModeStorageImpl) removeUser(user storagetype.User) {
-	for i, u := range cs.ClusterModeData.Users {
-		if u.Name == user.Name {
-			cs.ClusterModeData.Users = slices.Delete(cs.ClusterModeData.Users, i, i+1)
-			break
+	for i := range out.Journal {
+		if out.Journal[i].Status == storagetype.StatusPersisted {
+			// A durable entry that survived a crash means its generation is
+			// materialized in Users; the startup rebuild publishes it.
+			out.Journal[i].Status = storagetype.StatusPublished
 		}
 	}
+	return out
 }
 
-func (cs *clusterModeStorageImpl) removeUsers(users storagetype.Users) {
-	for _, user := range users {
-		cs.removeUser(user)
+func lastOperationID(data storagetype.ClusterModeData) string {
+	if len(data.Journal) == 0 {
+		return ""
 	}
+	return data.Journal[len(data.Journal)-1].ID
 }
 
-func (cs *clusterModeStorageImpl) store() error {
-	return cs.storage.Store(cs.ClusterModeData)
+func equalData(a, b storagetype.ClusterModeData) bool {
+	if a.Generation != b.Generation || len(a.Users) != len(b.Users) || len(a.Journal) != len(b.Journal) {
+		return false
+	}
+	for i := range a.Journal {
+		if a.Journal[i].Status != b.Journal[i].Status {
+			return false
+		}
+	}
+	return slices.EqualFunc(a.Users, b.Users, func(x, y storagetype.User) bool {
+		return x.Name == y.Name && strPtrEq(x.Password, y.Password) && boolPtrEq(x.Insecure, y.Insecure)
+	})
 }
 
-func (cs *clusterModeStorageImpl) load() (storagetype.ClusterModeData, error) {
-	return cs.storage.Get()
+func strPtrEq(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func boolPtrEq(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func cloneUsers(users storagetype.Users) storagetype.Users {
+	if users == nil {
+		return nil
+	}
+	out := make(storagetype.Users, len(users))
+	for i, u := range users {
+		out[i] = u
+		if u.Insecure != nil {
+			v := *u.Insecure
+			out[i].Insecure = &v
+		}
+		if u.Password != nil {
+			v := *u.Password
+			out[i].Password = &v
+		}
+	}
+	return out
+}
+
+func cloneData(data storagetype.ClusterModeData) storagetype.ClusterModeData {
+	out := storagetype.ClusterModeData{
+		Users:      cloneUsers(data.Users),
+		Generation: data.Generation,
+	}
+	if data.Journal != nil {
+		out.Journal = slices.Clone(data.Journal)
+	}
+	if data.LastFailure != nil {
+		v := *data.LastFailure
+		out.LastFailure = &v
+	}
+	return out
 }

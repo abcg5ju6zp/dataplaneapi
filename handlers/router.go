@@ -75,6 +75,7 @@ import (
 	config_version "github.com/haproxytech/dataplaneapi/handlers/configuration/version"
 
 	// dataplane
+	"github.com/haproxytech/dataplaneapi/handlers/dataplane/api_users"
 	"github.com/haproxytech/dataplaneapi/handlers/dataplane/discovery"
 	"github.com/haproxytech/dataplaneapi/handlers/dataplane/health"
 	"github.com/haproxytech/dataplaneapi/handlers/dataplane/info"
@@ -138,6 +139,10 @@ type Options struct {
 
 	// MaxOpenTransactions limits concurrent in-progress transactions (0 = unlimited).
 	MaxOpenTransactions int
+
+	// APIUserStore backs the API user management endpoints; nil disables them
+	// (deployments without dataplane storage).
+	APIUserStore api_users.Store
 
 	// SwaggerJSON is the raw OpenAPI v2 / swagger spec passed to the discovery and
 	// specification handlers. It must not be nil.
@@ -230,6 +235,7 @@ func NewRouter(opts Options) (http.Handler, error) {
 		func() error { return spoe_version.RegisterRouter(r, opts.Client) },
 
 		// — dataplane —
+		func() error { return api_users.RegisterRouter(r, opts.APIUserStore) },
 		func() error { return discovery.RegisterRouter(r, opts.SwaggerJSON) },
 		func() error { return health.RegisterRouter(r, opts.ReloadAgent) },
 		func() error { return info.RegisterRouter(r, opts.Version, opts.BuildTime, opts.SystemInfo) },
